@@ -1,0 +1,27 @@
+{
+  "hybrid_version": "hybrid-rec-v1",
+  "fusion_method": "weighted",
+  "rrf_k": 60,
+  "weights": {
+    "content": 0.6,
+    "cf": 0.3,
+    "popularity": 0.1
+  },
+  "candidate_k_min": 100,
+  "candidate_k_max": 500,
+  "candidate_k_multiplier": 5,
+  "fallback_policy_version": "cold-start-v1",
+  "content_rec_version": "content-rec-v1",
+  "cf_model_version": "bpr-mf-v1",
+  "popularity_rule": "count_interactions_current_postgres",
+  "evaluation_version": "recsys-eval-v1",
+  "tune_protocol": "hybrid-rec-tune-v1",
+  "created_at": "2026-08-23T17:05:36.538063+00:00",
+  "git_commit": "d2946eb175cde3f064547e938936a0f52a4f66a2",
+  "note": "Frozen from hybrid-rec-tune-v1 selected_fusion_method=weighted weight=c60_cf30_p10. External test unused.",
+  "seen_item_handling": "exclude_current_request_history",
+  "unavailable_channel": "drop_and_renormalize_weighted_or_omit_rrf_term",
+  "missing_candidate": "contribute_zero",
+  "candidate_union": "product_id_union_not_intersection",
+  "score_semantics": "rank_fusion_or_minmax_weighted_not_probability"
+}

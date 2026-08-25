@@ -1,0 +1,39 @@
+{
+  "personalization_version": "personalized-search-v1",
+  "feature_version": "personalization-features-v1",
+  "base_retrieval_mode": "hybrid",
+  "base_fusion_method": "rrf",
+  "base_rerank_mode": "none",
+  "candidate_k": 100,
+  "signals": [
+    "content",
+    "cf"
+  ],
+  "weights": {
+    "content": 0.0,
+    "cf": 1.0
+  },
+  "gamma": 0.3,
+  "gamma_max": 0.3,
+  "normalization": "minmax",
+  "equal_score_query_fallback": "rank_based",
+  "gating_formula": "Q * (1 + gamma * P)",
+  "tie_break": [
+    "final_score_desc",
+    "baseline_rank_asc",
+    "product_id_asc"
+  ],
+  "cold_user": "baseline_search",
+  "query_generator_version": "ltr-synthetic-v1",
+  "tune_protocol": "personalized-search-tune-v1",
+  "evaluation_version": "personalized-search-eval-v1",
+  "created_at": "2026-08-23T18:05:14.444219+00:00",
+  "git_commit": "4e56cb943d6eec23dd9634082c10bf3a00317283",
+  "note": "Frozen from personalized-search-tune-v1 winner=cf_only|g0.30. External test unused. Temporary inner-train BPR-MF is not a new CF model.",
+  "candidate_invariant": "same_ids_permutation_only",
+  "seen_item_handling": "search_may_return_previously_interacted_items",
+  "unavailable_channel": "drop_and_renormalize_or_uniform_if_remaining_weights_zero",
+  "missing_candidate_signal": "contribute_zero",
+  "score_semantics": "bounded_rerank_not_probability",
+  "recommendation_candidates": "never_merged"
+}

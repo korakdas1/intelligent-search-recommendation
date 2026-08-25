@@ -1,0 +1,99 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local secrets and environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.~lock.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and temp
+logs/
+*.log
+tmp/
+temp/
+*.tmp
+
+# Local PostgreSQL / database dumps
+postgres-data/
+*.sql.gz
+*.dump
+
+# Raw and processed datasets (do not commit source dumps)
+data/raw/
+data/processed/
+data/samples/*
+!data/samples/README.md
+data/.hf_cache/
+
+# Compressed / jsonl dumps anywhere under data
+data/**/*.jsonl
+data/**/*.jsonl.gz
+data/**/*.parquet
+data/**/*.csv.gz
+
+
+# Ingestion reports (counts/checksums only; still gitignored with data)
+artifacts/ingestion/
+
+# Generated ML artifacts
+artifacts/embeddings/
+artifacts/indexes/
+artifacts/models/
+artifacts/evaluation/
+artifacts/ranking_features/
+artifacts/ltr/
+artifacts/public_export/
+*.faiss
+*.index
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Hugging Face / model caches
+.cache/
+huggingface/
+~/.cache/
+
+# Local experiment scratch
+wandb/
+mlruns/
+lightning_logs/

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Intelligent Search &amp; Recommendation Engine</title>
+  <link rel="stylesheet" href="/static/demo/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="wrap">
+      <p class="eyebrow">Local demonstration</p>
+      <h1>Intelligent Search &amp; Recommendation Engine</h1>
+      <p class="lede">
+        Explore lexical, semantic and hybrid search alongside learned reranking,
+        personalization and recommendation systems.
+      </p>
+      <div id="system-status" class="status-row" aria-live="polite">Checking system status…</div>
+    </div>
+  </header>
+
+  <main id="main" class="wrap">
+    <section class="panel" aria-labelledby="search-heading">
+      <h2 id="search-heading">Product search</h2>
+      <p class="hint">
+        Enter a query and choose how to retrieve products. Hybrid fusion is available
+        for hybrid mode; RankNet and personalization are optional and only rerank those candidates.
+      </p>
+      <form id="search-form" class="stack">
+        <div class="field">
+          <label for="query">Query</label>
+          <input id="query" name="query" type="search" maxlength="512" required
+                 placeholder="leather conditioner" autocomplete="off">
+        </div>
+        <div class="example-row" aria-label="Example queries">
+          <button type="button" class="chip" data-query="leather conditioner">leather conditioner</button>
+          <button type="button" class="chip" data-query="sunscreen">sunscreen</button>
+          <button type="button" class="chip" data-query="baby shampoo">baby shampoo</button>
+          <button type="button" class="chip" data-query="hair color">hair color</button>
+        </div>
+        <div class="grid-controls">
+          <div class="field">
+            <label for="retrieval-mode">Retrieval mode</label>
+            <select id="retrieval-mode" name="retrieval_mode">
+              <option value="keyword">Keyword</option>
+              <option value="semantic">Semantic</option>
+              <option value="hybrid" selected>Hybrid</option>
+            </select>
+          </div>
+          <div class="field" id="fusion-field">
+            <label for="fusion-method">Hybrid fusion</label>
+            <select id="fusion-method" name="fusion_method">
+              <option value="weighted" selected>Weighted</option>
+              <option value="rrf">Reciprocal Rank Fusion (RRF)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="search-top-k">Results</label>
+            <select id="search-top-k" name="top_k">
+              <option value="5">5</option>
+              <option value="10" selected>10</option>
+              <option value="20">20</option>
+            </select>
+          </div>
+        </div>
+        <fieldset class="options" id="hybrid-options">
+          <legend>Optional hybrid reranking</legend>
+          <label class="check">
+            <input id="use-ltr" type="checkbox">
+            Learning-to-rank
+          </label>
+          <p class="fine">
+            Optional PyTorch RankNet reranker. It remains opt-in because it did not
+            outperform hybrid fusion on the documented synthetic benchmark.
+          </p>
+          <label class="check">
+            <input id="use-personalization" type="checkbox">
+            Personalized reranking
+          </label>
+          <p class="fine">
+            Reranks the same search candidates using a known user’s history. Requires a user ID.
+          </p>
+          <div class="field" id="user-field" hidden>
+            <label for="search-user-id">User ID</label>
+            <input id="search-user-id" type="text" maxlength="256" autocomplete="off"
+                   placeholder="Required when personalization is on" disabled>
+          </div>
+        </fieldset>
+        <div class="actions">
+          <button type="submit" id="search-submit">Search</button>
+          <span id="search-status" class="status" role="status"></span>
+        </div>
+      </form>
+      <p id="search-error" class="error" hidden></p>
+      <div id="search-meta" class="meta-row" hidden></div>
+      <div id="search-results" class="cards" aria-live="polite"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="similar-heading">
+      <h2 id="similar-heading">Similar products</h2>
+      <p class="hint">
+        Embedding neighbors of a catalog product. Enter a product ID, or use
+        Find similar on a search result.
+      </p>
+      <form id="similar-form" class="inline-form">
+        <div class="field grow">
+          <label for="similar-id">Product ID</label>
+          <input id="similar-id" type="text" maxlength="64" required placeholder="B00…">
+        </div>
+        <div class="field">
+          <label for="similar-top-k">Results</label>
+          <select id="similar-top-k">
+            <option value="5" selected>5</option>
+            <option value="10">10</option>
+          </select>
+        </div>
+        <button type="submit" id="similar-submit">Find similar</button>
+        <span id="similar-status" class="status" role="status"></span>
+      </form>
+      <p id="similar-error" class="error" hidden></p>
+      <div id="similar-meta" class="meta-row" hidden></div>
+      <div id="similar-results" class="cards"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="recs-heading">
+      <h2 id="recs-heading">User recommendations</h2>
+      <p class="hint">
+        Recommendations for a user, not search. This form requests hybrid; the API still
+        defaults to content when method is omitted.
+      </p>
+      <form id="recs-form" class="inline-form">
+        <div class="field grow">
+          <label for="rec-user-id">User ID</label>
+          <input id="rec-user-id" type="text" maxlength="256" required>
+        </div>
+        <div class="field">
+          <label for="rec-method">Method</label>
+          <select id="rec-method">
+            <option value="hybrid" selected>Hybrid</option>
+            <option value="content">Content</option>
+            <option value="cf">Collaborative filtering</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="rec-top-k">Results</label>
+          <select id="rec-top-k">
+            <option value="5" selected>5</option>
+            <option value="10">10</option>
+          </select>
+        </div>
+        <button type="submit" id="recs-submit">Recommend</button>
+        <span id="recs-status" class="status" role="status"></span>
+      </form>
+      <p id="recs-error" class="error" hidden></p>
+      <div id="recs-meta" class="meta-row" hidden></div>
+      <div id="recs-results" class="cards"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="popular-heading">
+      <h2 id="popular-heading">Popular products</h2>
+      <p class="hint">
+        Historical interaction popularity from the ingested catalog, not live traffic.
+      </p>
+      <form id="popular-form" class="inline-form">
+        <div class="field">
+          <label for="popular-top-k">Results</label>
+          <select id="popular-top-k">
+            <option value="5" selected>5</option>
+            <option value="10">10</option>
+          </select>
+        </div>
+        <button type="submit" id="popular-submit">Show popular</button>
+        <span id="popular-status" class="status" role="status"></span>
+      </form>
+      <p id="popular-error" class="error" hidden></p>
+      <div id="popular-meta" class="meta-row" hidden></div>
+      <div id="popular-results" class="cards"></div>
+    </section>
+  </main>
+
+  <footer class="site-footer wrap">
+    <p>
+      Local demo only. Scores are ranking scores, not probabilities.
+      OpenAPI is available at <a href="/docs">/docs</a>.
+    </p>
+  </footer>
+  <script src="/static/demo/app.js"></script>
+</body>
+</html>
