@@ -219,4 +219,4 @@ Random seed default is 42. Policies `hybrid-rec-v1` and `personalized-search-v1`
 - `sentence-transformers/all-MiniLM-L6-v2`
 - FAISS, PyTorch, PostgreSQL, FastAPI, SQLAlchemy, sentence-transformers
 
-A code license for this repository is an owner decision and is not asserted in this snapshot.
+This repository's original code is released under the MIT License. Third-party datasets, models, and libraries remain subject to their respective licenses and terms.
