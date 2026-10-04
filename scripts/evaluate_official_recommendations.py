@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -38,11 +39,13 @@ from app.evaluation.metrics import macro_average
 from app.recommendations.cf_artifacts import load_cf_bundle
 from app.recommendations.cf_constants import CATALOG_SIZE_E008, MODEL_VERSION
 from app.recommendations.cf_data import (
+    EvalUserRecord,
     RecsysEvalIncompatibleError,
     external_train_pairs,
     item_train_degrees,
     load_recsys_eval_split,
 )
+from app.recommendations.cf_model import BPRMatrixFactorization
 from app.recommendations.cf_train import rank_hidden_from_scores
 from app.recommendations.constants import CONTENT_REC_VERSION, EVALUATION_VERSION
 from app.recommendations.evaluation import history_size_bin, rank_to_metrics
@@ -129,8 +132,64 @@ def _segment(rows: dict[str, list[dict[str, float]]]) -> dict[str, dict[str, flo
     return {key: macro_average(values) for key, values in sorted(rows.items())}
 
 
+def _score_content_batch(
+    users: Sequence[EvalUserRecord], embeddings: np.ndarray, id_to_row: dict[str, int],
+) -> tuple[np.ndarray | None, dict[int, int]]:
+    """Score usable profiles in this batch and map local user offsets to rows."""
+
+    profiles: list[np.ndarray] = []
+    profile_rows: dict[int, int] = {}
+    for offset, user in enumerate(users):
+        train_rows = np.array(
+            [id_to_row[pid] for pid in user.train_product_ids if pid in id_to_row],
+            dtype=np.int64,
+        )
+        profile = mean_profile(embeddings, train_rows)
+        if profile is not None:
+            profile_rows[offset] = len(profiles)
+            profiles.append(profile)
+    scores = np.stack(profiles) @ embeddings.T if profiles else None
+    return scores, profile_rows
+
+
+def _iter_user_scores(
+    users: Sequence[EvalUserRecord],
+    *,
+    model: BPRMatrixFactorization,
+    cf_user_indices: Sequence[int],
+    embeddings: np.ndarray,
+    id_to_row: dict[str, int],
+    batch_size: int,
+) -> Iterator[tuple[EvalUserRecord, np.ndarray | None, np.ndarray]]:
+    """Yield score views in user order, retaining only the current batch.
+
+    The consumer must finish evaluating and release each view before advancing.
+    Compact metrics/candidates may survive; full score rows must not be retained.
+    """
+
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    for start in range(0, len(users), batch_size):
+        batch_users = users[start : start + batch_size]
+        cf_scores = score_cf_users(
+            model, cf_user_indices[start : start + batch_size], batch_size=batch_size,
+        )
+        content_scores, profile_rows = _score_content_batch(batch_users, embeddings, id_to_row)
+        for offset, user in enumerate(batch_users):
+            yield (
+                user,
+                content_scores[profile_rows[offset]] if offset in profile_rows else None,
+                cf_scores[offset],
+            )
+        # Drop owners before allocating the next batch, including the final batch.
+        del content_scores, cf_scores
+
+
 def main() -> int:
     args = parse_args()
+    if args.batch_size < 1:
+        print("--batch-size must be at least 1", file=sys.stderr)
+        return 2
     settings = get_settings()
     split_dir = Path(args.split_dir or Path(settings.artifacts_root) / "evaluation" / args.evaluation_version)
     model_dir = Path(args.model_dir or Path(settings.artifacts_root) / "models" / MODEL_VERSION)
@@ -183,31 +242,8 @@ def main() -> int:
 
     started = time.perf_counter()
     cf_user_indices = [user_to_index[user.user_id] for user in users]
-    cf_scores = score_cf_users(model, cf_user_indices, batch_size=args.batch_size)
     cf_ids = np.asarray(cf_item_ids)
-
-    profiles: list[np.ndarray] = []
-    profile_index: list[int] = []
-    for index, user in enumerate(users):
-        train_rows = np.array(
-            [id_to_row[pid] for pid in user.train_product_ids if pid in id_to_row],
-            dtype=np.int64,
-        )
-        profile = mean_profile(embeddings, train_rows)
-        if profile is None:
-            continue
-        profiles.append(profile)
-        profile_index.append(index)
-    content_scores_by_user: dict[int, np.ndarray] = {}
     embedding_matrix = np.asarray(embeddings)
-    for start in range(0, len(profiles), args.batch_size):
-        chunk = np.stack(profiles[start : start + args.batch_size])
-        scores = chunk @ embedding_matrix.T
-        for offset, user_i in enumerate(profile_index[start : start + args.batch_size]):
-            content_scores_by_user[user_i] = scores[offset]
-        done = min(start + args.batch_size, len(profiles))
-        if done % 256 == 0 or done == len(profiles):
-            print(f"  content scores {done}/{len(profiles)}", flush=True)
 
     systems = ("popularity", "content", "cf", "hybrid")
     rows: dict[str, list[dict[str, float]]] = {name: [] for name in systems}
@@ -219,7 +255,12 @@ def main() -> int:
     }
     coverage_sum = defaultdict(int)
     print(f"{OFFICIAL_REC_EVAL}: scoring {len(users)} users", flush=True)
-    for index, user in enumerate(users):
+    user_scores = _iter_user_scores(
+        users, model=model, cf_user_indices=cf_user_indices,
+        embeddings=embedding_matrix, id_to_row=id_to_row, batch_size=args.batch_size,
+    )
+    evaluated = 0
+    for user, content_vec, cf_vec in user_scores:
         exclude = set(user.train_product_ids)
         hidden_row = id_to_row.get(user.hidden_product_id)
         seen_rows = exclude_row_indices(exclude, id_to_row)
@@ -235,7 +276,6 @@ def main() -> int:
                 pop_scores, catalog_product_ids, seen_rows=seen_rows, hidden_row=int(hidden_row)
             )
             pop_metrics = rank_to_metrics(pop_rank, catalog_size)
-            content_vec = content_scores_by_user.get(index)
             if content_vec is None:
                 content_metrics = rank_to_metrics(None, catalog_size)
             else:
@@ -250,7 +290,7 @@ def main() -> int:
             cf_metrics = rank_to_metrics(None, catalog_size)
         else:
             cf_rank = rank_hidden_from_scores(
-                cf_scores[index],
+                cf_vec,
                 cf_ids,
                 seen_indices=seen_cf,
                 hidden_index=int(hidden_cf),
@@ -258,16 +298,16 @@ def main() -> int:
             cf_metrics = rank_to_metrics(cf_rank, catalog_size)
 
         content_cands = None
-        if index in content_scores_by_user:
+        if content_vec is not None:
             content_cands = content_candidates_from_scores(
-                content_scores_by_user[index],
+                content_vec,
                 catalog_product_ids,
                 exclude=exclude,
                 top_k=candidate_k,
                 exclude_indices=seen_rows,
             )
         cf_cands = cf_candidates_from_scores(
-            cf_scores[index],
+            cf_vec,
             cf_item_ids,
             exclude=exclude,
             top_k=candidate_k,
@@ -302,8 +342,11 @@ def main() -> int:
             rows[name].append(metrics)
             by_history[name][hist].append(metrics)
             by_degree[name][degree_bin].append(metrics)
-        if (index + 1) % 2000 == 0 or index + 1 == len(users):
-            print(f"  ranked {index + 1}/{len(users)}", flush=True)
+        evaluated += 1
+        if evaluated % 2000 == 0 or evaluated == len(users):
+            print(f"  ranked {evaluated}/{len(users)}", flush=True)
+        # A NumPy row view keeps its whole batch alive until this reference dies.
+        del content_vec, cf_vec
 
     elapsed = time.perf_counter() - started
     n_users = len(users)
