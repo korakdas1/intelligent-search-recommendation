@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 
+from app.recommendations.hybrid_candidates import topk_ids_from_scores
 from app.recommendations.hybrid_constants import (
     CHANNEL_CF,
     CHANNEL_CONTENT,
@@ -29,6 +31,114 @@ from app.search.fusion import rrf_contribution
 
 def _scored(ids_scores: list[tuple[str, float]]) -> list[ScoredItem]:
     return [ScoredItem(product_id=product_id, score=score) for product_id, score in ids_scores]
+
+
+def _reference_topk(product_ids, scores, *, exclude: set[str], top_k: int) -> list[ScoredItem]:
+    if top_k < 1:
+        return []
+    items = [
+        ScoredItem(str(product_id), float(score))
+        for product_id, score in zip(product_ids, np.asarray(scores, dtype=np.float64), strict=True)
+        if str(product_id) not in exclude and np.isfinite(score)
+    ]
+    return sorted(items, key=lambda item: (-item.score, item.product_id))[:top_k]
+
+
+def test_offline_topk_cutoff_tie_chooses_lexicographically_first_ids() -> None:
+    ids = ["P30", "P28", "P27", "P24", "P19", "P16", "P06", "P02"]
+    scores = np.ones(len(ids))
+    expected = _scored([(product_id, 1.0) for product_id in ["P02", "P06", "P16", "P19", "P24"]])
+    assert _reference_topk(ids, scores, exclude=set(), top_k=5) == expected
+    assert topk_ids_from_scores(ids, scores, exclude=set(), top_k=5) == expected
+
+
+@pytest.mark.parametrize("top_k", [1, 3, 5, 8, 12])
+@pytest.mark.parametrize(
+    "scores",
+    [
+        [1, 1, 1, 1, 1, 1, 1, 1],
+        [3, 3, 3, 2, 1, 0, -1, -2],
+        [3, 2, 2, 2, 2, 2, 1, 0],
+        [3, 3, 2, 2, 1, 1, 0, 0],
+    ],
+    ids=["all-equal", "tie-ends-at-k", "tie-spans-k", "multiple-groups"],
+)
+def test_offline_topk_ties_are_independent_of_input_order(scores, top_k: int) -> None:
+    ids = np.array(["P08", "P02", "P07", "P01", "P05", "P03", "P06", "P04"])
+    values = np.asarray(scores, dtype=np.float64)
+    expected = _reference_topk(ids, values, exclude=set(), top_k=top_k)
+    for order in (np.arange(8), np.arange(8)[::-1], np.random.default_rng(42).permutation(8)):
+        assert topk_ids_from_scores(ids[order], values[order], exclude=set(), top_k=top_k) == expected
+
+
+@pytest.mark.parametrize("exclude", [{"A", "B"}, {"HIGH"}, {"HIGH", "A", "B"}])
+@pytest.mark.parametrize("top_k", [1, 3, 20])
+def test_offline_topk_exclusion_paths_refill_ties_identically(exclude: set[str], top_k: int) -> None:
+    ids = np.array(["HIGH", "E", "C", "A", "D", "B", "LOW"])
+    scores = np.array([9, 1, 1, 1, 1, 1, -1], dtype=np.float64)
+    indices = np.array([index for index, product_id in enumerate(ids) if product_id in exclude])
+    expected = _reference_topk(ids, scores, exclude=exclude, top_k=top_k)
+    assert topk_ids_from_scores(ids, scores, exclude=exclude, top_k=top_k) == expected
+    assert topk_ids_from_scores(ids, scores, exclude=set(), exclude_indices=indices, top_k=top_k) == expected
+    assert topk_ids_from_scores(ids, scores, exclude=exclude, exclude_indices=indices, top_k=top_k) == expected
+
+
+def test_offline_topk_retains_exclusion_indices_precedence_and_empty_fallback() -> None:
+    ids = ["C", "B", "A"]
+    scores = np.ones(3)
+    assert topk_ids_from_scores(
+        ids, scores, exclude={"A"}, exclude_indices=np.array([0]), top_k=2,
+    ) == _scored([("A", 1.0), ("B", 1.0)])
+    assert topk_ids_from_scores(
+        ids, scores, exclude={"A"}, exclude_indices=np.array([], dtype=np.int64), top_k=2,
+    ) == _scored([("B", 1.0), ("C", 1.0)])
+
+
+@pytest.mark.parametrize("top_k", [1, 3, 5, 20])
+def test_offline_topk_only_finite_scores_preserving_float64_values(top_k: int) -> None:
+    ids = ["NAN", "POS_INF", "NEG_INF", "ZERO_B", "NEG_B", "ZERO_A", "NEG_A", "PRECISE"]
+    scores = np.array([np.nan, np.inf, -np.inf, 0.0, -2.5, -0.0, -2.5, 1.0000000000000002])
+    original = scores.copy()
+    result = topk_ids_from_scores(ids, scores, exclude=set(), top_k=top_k)
+    assert result == _reference_topk(ids, scores, exclude=set(), top_k=top_k)
+    assert result[0].score == 1.0000000000000002
+    np.testing.assert_array_equal(scores, original)
+
+
+@pytest.mark.parametrize("top_k", [0, -1])
+def test_offline_topk_nonpositive_k(top_k: int) -> None:
+    assert topk_ids_from_scores(["A"], np.array([1.0]), exclude=set(), top_k=top_k) == []
+
+
+def test_offline_topk_empty_or_no_valid_candidates() -> None:
+    assert topk_ids_from_scores([], np.array([]), exclude=set(), top_k=5) == []
+    assert topk_ids_from_scores(["A"], np.ones(1), exclude={"A"}, top_k=5) == []
+    assert topk_ids_from_scores(
+        ["A", "B", "C"], np.array([np.nan, np.inf, -np.inf]), exclude=set(), top_k=5,
+    ) == []
+
+
+def test_offline_topk_rejects_mismatched_lengths() -> None:
+    with pytest.raises(ValueError, match="product_ids and scores length mismatch"):
+        topk_ids_from_scores(["A"], np.ones(2), exclude=set(), top_k=1)
+
+
+@pytest.mark.parametrize("seed", [0, 7, 19, 42, 2026])
+def test_offline_topk_randomized_reference_parity(seed: int) -> None:
+    rng = np.random.default_rng(seed)
+    for count in (1, 8, 37, 128):
+        ids = np.array([f"P{index:04d}" for index in rng.permutation(count)])
+        scores = rng.choice([-3.5, -1.0, 0.0, 0.25, 1.0, 2.0], size=count)
+        indices = np.flatnonzero(rng.random(count) < 0.25)
+        exclude = set(ids[indices])
+        original = scores.copy()
+        for top_k in (0, 1, 3, count // 2, count, count + 5):
+            expected = _reference_topk(ids, scores, exclude=exclude, top_k=top_k)
+            assert topk_ids_from_scores(ids, scores, exclude=exclude, top_k=top_k) == expected
+            assert topk_ids_from_scores(
+                ids, scores, exclude=set(), exclude_indices=indices, top_k=top_k,
+            ) == expected
+        np.testing.assert_array_equal(scores, original)
 
 
 def _prompt_lists() -> tuple[list[ScoredItem], list[ScoredItem], list[ScoredItem]]:

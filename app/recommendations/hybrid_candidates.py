@@ -112,7 +112,11 @@ def topk_ids_from_scores(
     top_k: int,
     exclude_indices: np.ndarray | None = None,
 ) -> list[ScoredItem]:
-    """Score DESC, id ASC, excluding ``exclude``. Used by offline evaluation."""
+    """Rank finite, non-excluded scores DESC, id ASC, including cutoff ties.
+
+    Used by offline evaluation. Nonempty ``exclude_indices`` takes precedence
+    over ``exclude``; returned scores retain their float64 working values.
+    """
 
     if top_k < 1 or len(product_ids) == 0:
         return []
@@ -126,10 +130,19 @@ def topk_ids_from_scores(
     elif exclude:
         keep = np.array([str(product_id) not in exclude for product_id in ids], dtype=bool)
         masked = np.where(keep, masked, -np.inf)
-    valid = np.isfinite(masked)
-    take = min(int(top_k), int(np.count_nonzero(valid)))
+    valid_indices = np.flatnonzero(np.isfinite(masked))
+    take = min(int(top_k), len(valid_indices))
     if take < 1:
         return []
-    pool = np.argpartition(-masked, take - 1)[:take]
+    pool = valid_indices
+    if take < len(valid_indices):
+        valid_scores = masked[valid_indices]
+        cutoff = np.partition(valid_scores, len(valid_scores) - take)[len(valid_scores) - take]
+        better = valid_indices[valid_scores > cutoff]
+        tied = valid_indices[valid_scores == cutoff]
+        # Select boundary ties by id before truncating; partition alone picks
+        # an arbitrary subset. Only the tie group and selected pool are sorted.
+        tied = tied[np.argsort(ids[tied])[: take - len(better)]]
+        pool = np.concatenate((better, tied))
     ordered = pool[np.lexsort((ids[pool], -masked[pool]))]
     return [ScoredItem(product_id=str(ids[index]), score=float(working[index])) for index in ordered]
