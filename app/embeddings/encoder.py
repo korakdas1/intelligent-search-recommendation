@@ -72,7 +72,8 @@ class SentenceTransformerEncoder:
             return
         from sentence_transformers import SentenceTransformer
 
-        self._model = SentenceTransformer(self.model_name, device=self.device)
+        kwargs = {"revision": self.model_revision} if self.model_revision is not None else {}
+        self._model = SentenceTransformer(self.model_name, device=self.device, **kwargs)
         dim_fn = getattr(self._model, "get_embedding_dimension", None) or getattr(
             self._model, "get_sentence_embedding_dimension"
         )

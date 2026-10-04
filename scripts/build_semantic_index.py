@@ -45,6 +45,7 @@ from app.embeddings.constants import (
 from app.embeddings.encoder import SentenceTransformerEncoder, resolve_device
 from app.embeddings.io import save_embeddings, save_product_ids, write_json
 from app.embeddings.normalize import is_unit_normalized, row_norms
+from app.embeddings.provenance import SemanticCatalogFingerprint
 from app.embeddings.text import build_semantic_text
 from app.embeddings.versioning import (
     build_artifact_version,
@@ -97,6 +98,25 @@ def _model_card_facts(model_name: str) -> dict[str, str | None]:
     return facts
 
 
+def _encode_with_cpu_fallback(
+    encoder: SentenceTransformerEncoder, texts: list[str], *, batch_size: int
+) -> tuple[np.ndarray, SentenceTransformerEncoder]:
+    """Retry GPU encoding with the same requested model revision on CPU."""
+
+    try:
+        vectors = encoder.encode(texts, batch_size=batch_size, show_progress=True)
+    except Exception:
+        if encoder.device == "cpu":
+            raise
+        logger.warning("GPU encode failed; retrying remaining work on CPU")
+        encoder = SentenceTransformerEncoder(
+            encoder.model_name, device="cpu", model_revision=encoder.model_revision,
+            model_license=encoder.model_license,
+        )
+        vectors = encoder.encode(texts, batch_size=batch_size, show_progress=True)
+    return vectors, encoder
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-version", default=DATASET_VERSION_FULL)
@@ -118,6 +138,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Upsert artifact_versions rows (default: yes)",
     )
     args = parser.parse_args(argv)
+    if args.text_version != SEMANTIC_TEXT_VERSION:
+        parser.error(f"--text-version must match the implemented builder: {SEMANTIC_TEXT_VERSION}")
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     settings = get_settings()
@@ -155,7 +177,10 @@ def main(argv: list[str] | None = None) -> int:
         card = _model_card_facts(args.model_name)
         logger.info("loading encoder %s on %s", args.model_name, device)
         load_started = time.perf_counter()
-        encoder = SentenceTransformerEncoder(args.model_name, device=device)
+        encoder = SentenceTransformerEncoder(
+            args.model_name, device=device, model_revision=card["model_revision"],
+            model_license=card["model_license"],
+        )
         dim = encoder.embedding_dim
         model_load_s = time.perf_counter() - load_started
         if dim != EMBEDDING_DIMENSION:
@@ -164,14 +189,10 @@ def main(argv: list[str] | None = None) -> int:
             max_seq = getattr(encoder._model, "max_seq_length", None)
             if max_seq is not None:
                 card["max_seq_length"] = str(int(max_seq))
-            if not card["model_revision"]:
-                try:
-                    card["model_revision"] = str(encoder._model.model_card_data.base_model_revision)
-                except Exception:  # noqa: BLE001
-                    pass
 
         embeddings = np.empty((product_count, dim), dtype=np.float32)
         product_ids: list[str] = []
+        fingerprint = SemanticCatalogFingerprint()
         encode_started = time.perf_counter()
         offset = 0
         while offset < product_count:
@@ -193,20 +214,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 for row in rows
             ]
-            try:
-                vectors = encoder.encode(texts, batch_size=args.batch_size, show_progress=True)
-            except Exception:
-                if device != "cpu":
-                    logger.warning("GPU encode failed; retrying remaining work on CPU")
-                    device = "cpu"
-                    encoder = SentenceTransformerEncoder(args.model_name, device="cpu")
-                    vectors = encoder.encode(texts, batch_size=args.batch_size, show_progress=True)
-                else:
-                    raise
+            vectors, encoder = _encode_with_cpu_fallback(encoder, texts, batch_size=args.batch_size)
+            device = encoder.device
             if vectors.shape != (len(rows), dim):
                 raise RuntimeError(f"unexpected encode shape {vectors.shape}")
             embeddings[offset : offset + len(rows)] = vectors
             product_ids.extend(row.product_id for row in rows)
+            for row, text in zip(rows, texts, strict=True):
+                fingerprint.update(row.product_id, text)
             offset += len(rows)
             logger.info("encoded %s / %s", offset, product_count)
         encode_s = time.perf_counter() - encode_started
@@ -266,6 +281,7 @@ def main(argv: list[str] | None = None) -> int:
                 "dtype": VECTOR_DTYPE,
                 "normalized": True,
                 "semantic_text_version": args.text_version,
+                "semantic_catalog_sha256": fingerprint.hexdigest(),
                 "faiss_metric": FAISS_METRIC,
                 "exact_index_type": EXACT_INDEX_TYPE,
                 "ann_index_type": None if args.skip_hnsw else ANN_INDEX_TYPE,
@@ -309,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
                 "dtype": VECTOR_DTYPE,
                 "normalized": True,
                 "semantic_text_version": args.text_version,
+                "semantic_catalog_sha256": fingerprint.hexdigest(),
                 "faiss_metric": FAISS_METRIC,
                 "exact_index_type": EXACT_INDEX_TYPE,
                 "ann_index_type": None if args.skip_hnsw else ANN_INDEX_TYPE,

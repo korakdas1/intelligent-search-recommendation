@@ -12,6 +12,7 @@ import faiss
 import numpy as np
 
 from app.embeddings.constants import ANN_INDEX_TYPE, EXACT_INDEX_TYPE, FAISS_METRIC
+from app.embeddings.artifacts import ArtifactIncompatibleError
 
 
 def build_flat_ip_index(embeddings: np.ndarray) -> faiss.Index:
@@ -81,18 +82,28 @@ def load_index(path: Path) -> faiss.Index:
 
 
 def describe_index(index: faiss.Index) -> dict[str, int | str]:
-    name = type(index).__name__
-    kind = EXACT_INDEX_TYPE if "FlatIP" in name and "HNSW" not in name else name
-    if isinstance(index, faiss.IndexHNSWFlat) or "HNSW" in name:
-        kind = ANN_INDEX_TYPE
-    elif isinstance(index, faiss.IndexFlatIP) or name == "IndexFlatIP":
-        kind = EXACT_INDEX_TYPE
+    metric = int(index.metric_type)
     return {
-        "type": kind,
-        "metric": FAISS_METRIC,
+        "type": type(index).__name__,
+        "metric": FAISS_METRIC if metric == faiss.METRIC_INNER_PRODUCT else f"faiss_metric_{metric}",
         "ntotal": int(index.ntotal),
         "dimension": int(index.d),
     }
+
+
+def validate_index(index: faiss.Index, *, backend: str, dimension: int) -> None:
+    """Inspect the deserialized FAISS type and metric, not its filename."""
+
+    description = describe_index(index)
+    if description["metric"] != FAISS_METRIC:
+        raise ArtifactIncompatibleError("actual FAISS metric must be inner_product")
+    expected_type = EXACT_INDEX_TYPE if backend == "flat" else ANN_INDEX_TYPE
+    if description["type"] != expected_type:
+        raise ArtifactIncompatibleError(
+            f"actual FAISS type {description['type']} != expected {expected_type} for {backend}"
+        )
+    if description["dimension"] != dimension:
+        raise ArtifactIncompatibleError(f"index dimension {index.d} != manifest {dimension}")
 
 
 def _as_float32_2d(vectors: np.ndarray) -> np.ndarray:
