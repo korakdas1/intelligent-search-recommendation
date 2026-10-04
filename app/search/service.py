@@ -104,6 +104,7 @@ def run_search(
             top_k=top_k,
             fusion_method=resolve_fusion_method(fusion_method),
             log=log,
+            candidate_k=candidate_k,
         )
     if retrieval_mode == "semantic":
         return semantic_search(session, query=query, top_k=top_k, log=log)
@@ -114,5 +115,6 @@ def run_search(
             top_k=top_k,
             fusion_method=resolve_fusion_method(fusion_method),
             log=log,
+            candidate_k=candidate_k,
         )
     return keyword_search(session, query=query, top_k=top_k, log=log)

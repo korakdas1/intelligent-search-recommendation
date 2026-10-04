@@ -25,6 +25,7 @@ from app.recommendations.cf_data import mapping_checksum
 from app.recommendations.cf_model import BPRMatrixFactorization
 from app.recommendations.cf_runtime import reset_cf_runtime
 from app.search.faiss_index import build_flat_ip_index
+from app.search.candidates import resolve_candidate_k
 from app.search.runtime import SemanticRuntime, reset_semantic_runtime, set_semantic_runtime
 
 pytestmark = pytest.mark.postgres
@@ -134,7 +135,7 @@ def _seed(session: Session) -> None:
     session.commit()
 
 
-def _install_runtime() -> SemanticRuntime:
+def _install_runtime(extra_product_ids: list[str] | None = None) -> SemanticRuntime:
     embeddings = l2_normalize(
         np.array(
             [
@@ -146,12 +147,16 @@ def _install_runtime() -> SemanticRuntime:
             dtype=np.float32,
         )
     )
+    extra_product_ids = extra_product_ids or []
+    if extra_product_ids:
+        embeddings = np.vstack([embeddings, np.tile([0.9, 0.1, 0.0], (len(extra_product_ids), 1))])
+        embeddings = l2_normalize(embeddings.astype(np.float32))
     runtime = SemanticRuntime(
         artifact_version="p12-test",
         dataset_version="search_v1",
         model_name="fake-encoder",
         embedding_dim=3,
-        product_ids=np.array(["PAAA", "PBBB", "PCCC", "PSHAM"], dtype="U8"),
+        product_ids=np.array(["PAAA", "PBBB", "PCCC", "PSHAM", *extra_product_ids], dtype="U16"),
         index=build_flat_ip_index(embeddings),
         backend="flat",
         embedding_manifest={},
@@ -230,20 +235,44 @@ def test_unknown_user_404(client: TestClient, personalized_env: Session) -> None
     assert client.get("/recommendations/user/NOPE?method=content").status_code == 404
 
 
-def test_cold_user_matches_baseline(client: TestClient, personalized_env: Session) -> None:
-    del personalized_env
+@pytest.mark.parametrize("top_k", [5, 50])
+@pytest.mark.parametrize("fusion_method", ["rrf", "weighted"])
+def test_cold_user_matches_baseline(
+    client: TestClient, personalized_env: Session, monkeypatch: pytest.MonkeyPatch,
+    top_k: int, fusion_method: str,
+) -> None:
+    session = personalized_env
+    monkeypatch.delenv("HYBRID_CANDIDATE_K", raising=False)
+    monkeypatch.setenv("HYBRID_CANDIDATE_K_MAX", "500")
+    clear_settings_cache()
+    if top_k > 20:
+        extra_ids = [f"PDEP{index:04d}" for index in range(300)]
+        session.add_all([
+            Product(product_id=pid, dataset_version="search_v1", title=f"Leather Balm {pid}",
+                    category="All Beauty", currency="USD")
+            for pid in extra_ids
+        ])
+        session.commit()
+        _install_runtime(extra_ids)
     baseline = client.post(
         "/search",
-        json={"query": "leather", "top_k": 5, "retrieval_mode": "hybrid", "fusion_method": "rrf"},
+        json={"query": "leather", "top_k": top_k, "retrieval_mode": "hybrid", "fusion_method": fusion_method},
     )
-    personalized = client.post("/search", json=_payload("UEMPTY", top_k=5))
+    personalized = client.post("/search", json={**_payload("UEMPTY", top_k=top_k), "fusion_method": fusion_method})
+    assert baseline.status_code == 200
     assert personalized.status_code == 200
     body = personalized.json()
     assert body["personalization_applied"] is False
     assert body["personalization_reason"] == "no_personalized_history"
-    assert [row["product_id"] for row in body["results"]] == [
-        row["product_id"] for row in baseline.json()["results"]
+    # Scores keep the existing personalized normalization; ordered result data match.
+    assert [{key: value for key, value in row.items() if key != "score"} for row in body["results"]] == [
+        {key: value for key, value in row.items() if key != "score"} for row in baseline.json()["results"]
     ]
+    if top_k > 20:
+        assert len(body["results"]) == top_k
+    events = list(session.scalars(select(SearchEvent).order_by(SearchEvent.search_event_id.desc()).limit(2)))
+    assert len(events) == 2
+    assert [event.metadata_["candidate_k"] for event in events] == [resolve_candidate_k(top_k)] * 2
 
 
 def test_user_outside_cf_still_personalizes(client: TestClient, personalized_env: Session) -> None:
