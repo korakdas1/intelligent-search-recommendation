@@ -37,8 +37,15 @@ from app.evaluation.constants import (
 )
 from app.evaluation.io import write_json_atomic
 from app.evaluation.metrics import macro_average, metric_bundle, unique_preserve_order
-from app.ranking.constants import DATASET_VERSION, MODEL_VERSION
+from app.evaluation.provenance import (
+    ProvenanceError,
+    ranker_provenance,
+    semantic_provenance,
+    validate_ltr_dataset,
+)
+from app.ranking.constants import DATASET_VERSION
 from app.ranking.runtime import require_ltr_runtime
+from app.search.candidates import resolve_candidate_k
 from app.search.hybrid import FUSION_RRF, FUSION_WEIGHTED, collect_hybrid_fused, hybrid_search
 from app.search.ltr import ltr_search, score_ltr_union
 from app.search.runtime import require_semantic_runtime
@@ -185,6 +192,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"refusing to overwrite {out_path}; pass --force", file=sys.stderr)
         return 2
 
+    try:
+        _manifest, dataset_provenance = validate_ltr_dataset(
+            dataset_dir, required_files=("queries.json",),
+        )
+    except ProvenanceError as exc:
+        print(f"evaluation provenance rejected: {exc}", file=sys.stderr)
+        return 2
     raw_queries = json.loads(queries_path.read_text(encoding="utf-8"))
     split_queries = [row for row in raw_queries if row.get("split") == args.split]
     skipped: dict[str, int] = defaultdict(int)
@@ -204,8 +218,16 @@ def main(argv: list[str] | None = None) -> int:
 
     factory = get_session_factory()
     with factory() as session:
-        require_semantic_runtime(session)
-        require_ltr_runtime()
+        semantic_runtime = require_semantic_runtime(session)
+        ltr_runtime = require_ltr_runtime()
+        try:
+            ranker_identity = ranker_provenance(ltr_runtime, dataset_provenance)
+            semantic_identity = semantic_provenance(
+                semantic_runtime, configured_backend=settings.semantic_index_type,
+            )
+        except ProvenanceError as exc:
+            print(f"evaluation provenance rejected: {exc}", file=sys.stderr)
+            return 2
         print(
             f"{OFFICIAL_SEARCH_EVAL}: {len(usable)} usable / {len(split_queries)} {args.split} queries",
             flush=True,
@@ -320,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     family = {system: _family_metrics(records, system) for system in SYSTEMS}
 
-    e007 = _load_e007(Path(settings.artifacts_root) / "models" / MODEL_VERSION)
+    e007 = _load_e007(Path(ltr_runtime.directory))
     prior_all = (e007.get("all_queries") or {}) if e007 else {}
     reconciliation = {}
     if prior_all:
@@ -334,6 +356,39 @@ def main(argv: list[str] | None = None) -> int:
 
     ndcg10 = {system: all_metrics[system].get("ndcg@10", 0.0) for system in SYSTEMS}
     winner = max(ndcg10, key=ndcg10.get) if ndcg10 else None
+    input_provenance = {
+        "status": "verified" if all(status == "verified" for status in (
+            dataset_provenance["status"], ranker_identity["status"],
+            ranker_identity["dataset_linkage_status"], semantic_identity["status"],
+        )) else "legacy_unverified",
+        "ltr_dataset": dataset_provenance,
+        "ranker": ranker_identity,
+        "semantic": semantic_identity,
+    }
+    effective_config = {
+        "split": args.split,
+        "candidate_k": args.candidate_k,
+        "hybrid_candidate_k": resolve_candidate_k(
+            args.candidate_k, configured=args.candidate_k, maximum=settings.hybrid_candidate_k_max,
+        ),
+        "k_values": list(K_VALUES),
+        "rrf_k0": settings.hybrid_rrf_k,
+        "weighted_alpha": settings.hybrid_keyword_weight,
+        "semantic_backend": semantic_runtime.backend,
+        "semantic_faiss_type": semantic_identity["faiss"]["type"],
+        "semantic_hnsw_ef_search": settings.semantic_hnsw_ef_search if semantic_runtime.backend == "hnsw" else None,
+        "ltr_model_version": ltr_runtime.model_version,
+        "feature_version": ltr_runtime.feature_version,
+        "sampled": args.max_queries is not None,
+        "max_queries": args.max_queries,
+        "seed": args.seed,
+        "latency_sample_size_requested": args.latency_sample_size,
+        "latency_sample_size": sample_n,
+        "latency_result_k": 20,
+        "latency_hybrid_candidate_k": resolve_candidate_k(
+            20, configured=args.candidate_k, maximum=settings.hybrid_candidate_k_max,
+        ),
+    }
     payload = {
         "experiment_id": SEARCH_EXPERIMENT_ID,
         "evaluation_version": OFFICIAL_SEARCH_EVAL,
@@ -346,19 +401,21 @@ def main(argv: list[str] | None = None) -> int:
         "k_values": list(K_VALUES),
         "split": args.split,
         "query_generator": DATASET_VERSION,
-        "dataset_dir": str(dataset_dir),
+        "dataset_dir": dataset_provenance["artifact_dir"],
+        "input_provenance": input_provenance,
+        "effective_config": effective_config,
         "raw_split_queries": len(split_queries),
         "usable_queries": len(records),
         "skipped": dict(skipped),
-        "sampled": bool(args.max_queries),
+        "sampled": args.max_queries is not None,
         "max_queries": args.max_queries,
         "seed": args.seed,
         "candidate_k": args.candidate_k,
         "rrf_k0": settings.hybrid_rrf_k,
         "weighted_alpha": settings.hybrid_keyword_weight,
-        "ltr_model": MODEL_VERSION,
-        "feature_version": "rank-features-v1",
-        "semantic_backend": "IndexFlatIP",
+        "ltr_model": ltr_runtime.model_version,
+        "feature_version": ltr_runtime.feature_version,
+        "semantic_backend": semantic_identity["faiss"]["type"],
         "system_types": {
             "keyword": "retriever",
             "semantic": "retriever",
@@ -387,7 +444,6 @@ def main(argv: list[str] | None = None) -> int:
         "not_human_relevance": True,
         "not_table_b": True,
     }
-    write_json_atomic(out_path, payload)
     print(json.dumps(
         {
             "path": str(out_path),
@@ -402,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
     if identity_fail:
         print("hybrid candidate identity failed; official Table A is invalid", file=sys.stderr)
         return 1
+    write_json_atomic(out_path, payload)
     return 0
 
 

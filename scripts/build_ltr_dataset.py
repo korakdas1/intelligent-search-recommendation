@@ -25,6 +25,7 @@ from app.core.config import get_settings
 from app.core.events import DATASET_VERSION_FULL
 from app.db.repositories.products import get_products_by_ids
 from app.db.session import get_session_factory, reset_engine
+from app.evaluation.provenance import ltr_artifact_checksums
 from app.models.product import Product
 from app.ranking.constants import DATASET_VERSION, DEFAULT_SPLIT_RATIOS, LABEL_CLASS
 from app.ranking.feature_schema import FEATURE_NAMES, FEATURE_NAMES_SHA256, FEATURE_VERSION
@@ -34,6 +35,16 @@ from app.ranking.product_view import ProductView
 from app.ranking.retrieval import collect_fused_candidates
 from app.ranking.split import assert_split_disjoint, grouped_source_split
 from app.search.runtime import load_semantic_runtime, reset_semantic_runtime, set_semantic_runtime
+
+SOURCE_ORDER_POLICY = "product_id_asc_before_seeded_shuffle"
+
+
+def select_source_products(
+    eligible: list[tuple[str, str, str | None]], *, seed: int, max_sources: int,
+) -> list[tuple[str, str, str | None]]:
+    ordered = sorted(eligible, key=lambda row: row[0])
+    random.Random(seed).shuffle(ordered)
+    return ordered[:max_sources]
 
 
 def _git_commit() -> str | None:
@@ -70,7 +81,6 @@ def main(argv: list[str] | None = None) -> int:
     runtime = load_semantic_runtime(settings)
     set_semantic_runtime(runtime)
     factory = get_session_factory()
-    rng = random.Random(args.seed)
 
     with factory() as session:
         rows = list(
@@ -87,8 +97,7 @@ def main(argv: list[str] | None = None) -> int:
                 skipped_title += 1
                 continue
             eligible.append((str(product_id), title or "", brand))
-        rng.shuffle(eligible)
-        selected = eligible[: args.max_sources]
+        selected = select_source_products(eligible, seed=args.seed, max_sources=args.max_sources)
 
         queries = []
         for product_id, title, brand in selected:
@@ -183,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
     test_q = [row for row in query_records if row["split"] == "test"]
     manifest = {
         "dataset_version": args.output_version,
+        "source_order_policy": SOURCE_ORDER_POLICY,
+        "checksums": ltr_artifact_checksums(tmp),
         "label_class": LABEL_CLASS,
         "query_families": sorted({row["query_source"] for row in query_records}),
         "source_product_count": len(source_ids),
