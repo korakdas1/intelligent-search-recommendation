@@ -23,6 +23,7 @@ from app.core.events import DATASET_VERSION_FULL
 from app.db.repositories.artifacts import upsert_artifact_version
 from app.db.session import get_session_factory, reset_engine
 from app.embeddings.checksums import sha256_file
+from app.evaluation.provenance import ProvenanceError, validate_ltr_dataset
 from app.ranking.artifacts import save_ranker_bundle
 from app.ranking.constants import (
     DATASET_VERSION,
@@ -78,6 +79,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"refusing to overwrite {out_dir}; pass --force", file=sys.stderr)
         return 2
 
+    try:
+        dataset_manifest, dataset_provenance = validate_ltr_dataset(
+            dataset_dir, required_files=("candidates.parquet",),
+        )
+    except ProvenanceError as exc:
+        print(f"training provenance rejected: {exc}", file=sys.stderr)
+        return 2
     frame = pd.read_parquet(parquet_path)
     for leaked in ("relevance", "source_product_id", "split", "candidate_position"):
         if leaked in FEATURE_NAMES:
@@ -143,11 +151,6 @@ def main(argv: list[str] | None = None) -> int:
         "architecture_selected_by": "validation_ranknet_loss",
         "architecture_name": winner["name"],
     }
-    dataset_manifest = {}
-    manifest_path = dataset_dir / "manifest.json"
-    if manifest_path.is_file():
-        dataset_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-
     tmp = out_dir.parent / f".{out_dir.name}.tmp"
     if tmp.exists():
         shutil.rmtree(tmp)
@@ -173,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
         "feature_version": FEATURE_VERSION,
         "feature_names_sha256": FEATURE_NAMES_SHA256,
         "dataset_version": dataset_manifest.get("dataset_version", DATASET_VERSION),
+        "ltr_dataset_provenance": dataset_provenance,
         "synthetic_label_version": DATASET_VERSION,
         "catalog_dataset_version": DATASET_VERSION_FULL,
         "split_seed": args.seed,
@@ -210,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     artifact_manifest["model_checksum"] = sha256_file(tmp / "model_state.pt")
     artifact_manifest["scaler_checksum"] = sha256_file(tmp / "scaler.npz")
+    artifact_manifest["model_config_checksum"] = sha256_file(tmp / "model_config.json")
     (tmp / "manifest.json").write_text(json.dumps(artifact_manifest, indent=2) + "\n", encoding="utf-8")
     if out_dir.exists():
         shutil.rmtree(out_dir)

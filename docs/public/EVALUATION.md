@@ -33,6 +33,14 @@ Protocol: frozen `ltr-synthetic-v1` TEST. Same query IDs for every system. Hybri
 
 Keyword won this synthetic title/attribute protocol. RankNet lost to both fusions. Weighted beat RRF on the same hybrid union. Coverage: keyword 82.4%, semantic 46.1%, hybrid/LTR 84.6%. Uncovered queries count as misses.
 
+### Provenance for future search evaluations
+
+New LTR builds sort eligible source products by product ID before seeded shuffling and record `source_order_policy`. Their manifests include exact SHA-256 checksums for `queries.json` and `candidates.parquet`. New RankNet builds validate those inputs before training and record their observed identity under `ltr_dataset_provenance`, together with model, scaler, and configuration checksums.
+
+Official search evaluation validates declared input checksums and ranker/dataset linkage before evaluating queries. Output records the query and available candidate-file hashes, loaded ranker identity, actual semantic backend/FAISS type and metric, semantic catalog identity, and effective search configuration. Artifact directories use logical names rather than local absolute paths. Candidate-identity failures return nonzero without creating or replacing the comparison JSON; valid output retains atomic writes and overwrite protection.
+
+Historical manifests without these declarations remain loadable with warnings and `legacy_unverified` provenance. Hashing their current bytes does not establish missing historical build identity or ranker/dataset linkage. Missing optional candidate parquet does not prevent search evaluation, but its identity remains unverified; declared mismatches are rejected. Historical E-012 metrics and artifacts were not regenerated. A future rebuild, even under the same dataset-version label, is identified by its own checksums.
+
 ## Personalized search (22,554 usable queries)
 
 Unpersonalized hybrid RRF vs bounded personalization on identical candidate IDs (22,554/22,554). Candidate coverage 80.7%.
