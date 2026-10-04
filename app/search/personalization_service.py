@@ -186,18 +186,22 @@ def personalized_search(
     before: datetime | None = None,
     policy: PersonalizationPolicy | None = None,
 ) -> SearchResponse:
-    """Rerank hybrid/LTR candidates for a known user. Unknown users raise 404."""
+    """Rerank hybrid/LTR candidates for a known user. Unknown users raise 404.
+
+    ``candidate_k=None`` uses the standard serving retrieval policy. The frozen
+    personalization policy's candidate_k is evaluation provenance, not a serving
+    override; internal/offline callers may still pass an explicit depth.
+    """
 
     if get_user(session, user_id) is None:
         raise SearchUserNotFound(user_id)
     chosen_policy = policy or load_personalization_policy()
-    depth = candidate_k if candidate_k is not None else chosen_policy.candidate_k
     baseline, collected = baseline_from_hybrid(
         session,
         query=query,
         top_k=top_k,
         fusion_method=fusion_method,
-        candidate_k=depth,
+        candidate_k=candidate_k,
         rerank_mode=rerank_mode,
     )
     outcome = personalize_baseline(
@@ -215,7 +219,7 @@ def personalized_search(
             "retrieval_mode": HYBRID_MODE,
             "fusion_method": fusion_method,
             "rerank_mode": rerank_mode,
-            "candidate_k": getattr(collected, "depth", depth) if not isinstance(collected, int) else collected,
+            "candidate_k": collected if isinstance(collected, int) else collected.depth,
             "personalization_mode": PERSONALIZATION_BOUNDED,
             "personalization_version": chosen_policy.personalization_version,
             "personalization_applied": outcome.applied,
