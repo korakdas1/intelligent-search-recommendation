@@ -192,7 +192,23 @@ source .venv/bin/activate
 pytest
 ```
 
-The full suite needs the PostgreSQL **test** database. Unit tests do not download MiniLM.
+Run `pytest tests/unit` without PostgreSQL, or `pytest tests/integration` for the
+database suite. Tests use temporary/fake artifacts and do not download datasets
+or MiniLM weights.
+
+The full suite needs a disposable PostgreSQL **test** database. Its name must
+exactly match `POSTGRES_TEST_DB` (default:
+`intelligent_search_recommendation_test`) and differ from `POSTGRES_DB`. This
+also applies to `TEST_DATABASE_URL` overrides; the fixture checks the connected
+database before running migrations or deleting table contents. Use only a
+database whose contents can be discarded. Fixture teardown restores
+`DATABASE_URL` and `APP_ENV`, including when setup fails or skips.
+
+Local integration tests skip if PostgreSQL is unavailable. Set
+`REQUIRE_POSTGRES_TESTS=1` to fail instead. GitHub Actions runs separate Python
+3.12 unit and integration jobs with CPU PyTorch and Hugging Face offline mode.
+The integration job uses a disposable PostgreSQL 16 service and rejects skipped
+or empty integration runs.
 
 ## Project structure
 

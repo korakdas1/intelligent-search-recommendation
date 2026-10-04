@@ -1,0 +1,82 @@
+name: Python tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  HF_DATASETS_OFFLINE: "1"
+
+jobs:
+  unit:
+    name: Unit tests (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install CPU PyTorch and project dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev]"
+      - name: Run complete unit suite
+        run: python -m pytest tests/unit
+
+  postgres:
+    name: PostgreSQL integration tests (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: intelligent_search_recommendation_test
+          POSTGRES_USER: isre_ci
+          POSTGRES_PASSWORD: ci_only_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U isre_ci -d intelligent_search_recommendation_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      APP_ENV: test
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_TEST_DB: intelligent_search_recommendation_test
+      POSTGRES_USER: isre_ci
+      POSTGRES_PASSWORD: ci_only_password
+      REQUIRE_POSTGRES_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install CPU PyTorch and project dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev]"
+      - name: Run real PostgreSQL integration suite
+        run: python -m pytest tests/integration --junitxml=integration-results.xml
+      - name: Require executed integration tests without skips
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          cases = list(ET.parse("integration-results.xml").iter("testcase"))
+          if not cases or any(case.find("skipped") is not None for case in cases):
+              raise SystemExit("Integration tests must execute without skips.")
+          print(f"Verified {len(cases)} integration tests executed without skips.")
+          PY

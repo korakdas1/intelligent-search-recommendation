@@ -1,7 +1,7 @@
 """PostgreSQL integration fixtures.
 
-Destructive operations run only against a database whose name contains
-``test``. The development catalog is never truncated here.
+The URL and connected database must exactly match ``POSTGRES_TEST_DB``,
+which must differ from ``POSTGRES_DB``, before migrations or table cleanup.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings, clear_settings_cache
@@ -28,54 +28,67 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def _test_url() -> str:
     settings = Settings()
-    return settings.resolved_test_database_url()
-
-
-def _database_name(url: str) -> str:
-    return url.rsplit("/", 1)[-1].split("?")[0]
+    url = settings.resolved_test_database_url()
+    parsed = make_url(url)
+    expected = settings.postgres_test_db
+    if (
+        parsed.get_backend_name() != "postgresql"
+        or not expected
+        or expected == settings.postgres_db
+        or parsed.database != expected
+    ):
+        raise RuntimeError(
+            "Refusing to run integration tests: the PostgreSQL database must "
+            "exactly match POSTGRES_TEST_DB and differ from POSTGRES_DB."
+        )
+    return url
 
 
 @pytest.fixture(scope="session")
 def postgres_engine() -> Iterator[Engine]:
     url = _test_url()
-    name = _database_name(url)
-    if "test" not in name.lower():
-        raise RuntimeError(f"Refusing to run integration tests against database {name!r}")
-
-    previous_database_url = os.environ.get("DATABASE_URL")
-    previous_app_env = os.environ.get("APP_ENV")
-    os.environ["DATABASE_URL"] = url
-    os.environ["APP_ENV"] = "test"
-    clear_settings_cache()
-    reset_engine()
-
-    engine = create_engine(url, future=True, pool_pre_ping=True)
+    name = make_url(url).database
+    engine = None
     try:
-        with engine.connect() as connection:
-            connection.execute(text("SELECT 1"))
-            connection.commit()
-    except Exception as exc:
-        engine.dispose()
-        pytest.skip(
-            "PostgreSQL test database is not reachable. "
-            f"Expected {name} at TEST_DATABASE_URL / POSTGRES_TEST_DB. "
-            f"Original error: {exc}"
-        )
+        with pytest.MonkeyPatch.context() as environment:
+            environment.setenv("DATABASE_URL", url)
+            environment.setenv("APP_ENV", "test")
+            clear_settings_cache()
+            reset_engine()
+            engine = create_engine(url, future=True, pool_pre_ping=True)
+            try:
+                connection = engine.connect()
+            except Exception:
+                message = (
+                    "PostgreSQL test database is not reachable. "
+                    f"Expected {name} at TEST_DATABASE_URL / POSTGRES_TEST_DB."
+                )
+                if os.environ.get("REQUIRE_POSTGRES_TESTS") == "1":
+                    pytest.fail(message, pytrace=False)
+                pytest.skip(message)
 
-    cfg = Config(str(ROOT / "alembic.ini"))
-    command.upgrade(cfg, "head")
-    yield engine
-    engine.dispose()
-    reset_engine()
-    clear_settings_cache()
-    if previous_database_url is None:
-        os.environ.pop("DATABASE_URL", None)
-    else:
-        os.environ["DATABASE_URL"] = previous_database_url
-    if previous_app_env is None:
-        os.environ.pop("APP_ENV", None)
-    else:
-        os.environ["APP_ENV"] = previous_app_env
+            with connection:
+                # Also catch connection options that override the URL database.
+                actual = connection.scalar(text("SELECT current_database()"))
+                if actual != name:
+                    raise RuntimeError(
+                        "Refusing to run integration tests: connected database "
+                        "does not match POSTGRES_TEST_DB."
+                    )
+
+            cfg = Config(str(ROOT / "alembic.ini"))
+            command.upgrade(cfg, "head")
+            yield engine
+    finally:
+        # The environment context has restored its values before caches reset.
+        try:
+            if engine is not None:
+                engine.dispose()
+        finally:
+            try:
+                reset_engine()
+            finally:
+                clear_settings_cache()
 
 
 @pytest.fixture
