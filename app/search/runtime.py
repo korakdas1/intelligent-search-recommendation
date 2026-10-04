@@ -6,6 +6,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -13,16 +14,19 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
+from app.db.repositories.products import semantic_catalog_fingerprint
 from app.embeddings.artifacts import (
     ArtifactIncompatibleError,
     ArtifactUnavailableError,
-    validate_manifest,
+    manifest_checksum,
+    validate_manifest_pair,
 )
+from app.embeddings.checksums import sha256_file
 from app.embeddings.encoder import TextEncoder
 from app.embeddings.versioning import embedding_paths, index_paths
 from app.models.product import Product
 from app.search.exceptions import SemanticUnavailableError
-from app.search.faiss_index import load_index
+from app.search.faiss_index import load_index, validate_index
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,8 @@ class SemanticRuntime:
     encoder: TextEncoder | None = None
     skip_catalog_count_check: bool = False
     _id_to_row: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _catalog_verified: bool = field(default=False, init=False, repr=False)
+    _catalog_validation_lock: Any = field(default_factory=Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._id_to_row = {str(product_id): index for index, product_id in enumerate(self.product_ids.tolist())}
@@ -122,37 +128,49 @@ def load_semantic_runtime(
         "semantic_text_version": settings.semantic_text_version,
         "normalized": True,
     }
-    validate_manifest(embedding_manifest, expected=expected)
-    if index_manifest.get("artifact_version") != version:
-        raise ArtifactIncompatibleError("index manifest artifact_version mismatch")
-    if index_manifest.get("dataset_version") != embedding_manifest.get("dataset_version"):
-        raise ArtifactIncompatibleError("index and embedding dataset versions differ")
+    validate_manifest_pair(embedding_manifest, index_manifest, expected=expected)
+    embedding_ids_checksum = manifest_checksum(embedding_manifest, "product_ids.npy")
+    index_ids_checksum = manifest_checksum(index_manifest, "product_ids.npy")
+    if embedding_ids_checksum != index_ids_checksum:
+        raise ArtifactIncompatibleError("embedding/index product_ids.npy checksum mismatch")
+    if sha256_file(embed_paths["product_ids"]) != embedding_ids_checksum:
+        raise ArtifactIncompatibleError("product_ids.npy checksum mismatch")
+    # Verify all consumed file bytes before deserializing the FAISS trust boundary.
+    index_checksum = manifest_checksum(index_manifest, index_path.name)
+    if sha256_file(index_path) != index_checksum:
+        raise ArtifactIncompatibleError(f"{index_path.name} checksum mismatch")
 
-    product_ids = np.load(embed_paths["product_ids"], allow_pickle=False)
-    if product_ids.ndim != 1:
-        raise ArtifactIncompatibleError("product_ids.npy must be a 1-D array")
-    index = load_index(index_path)
-    if backend == "hnsw" and hasattr(index, "hnsw"):
-        index.hnsw.efSearch = settings.semantic_hnsw_ef_search
+    try:
+        product_ids = np.load(embed_paths["product_ids"], allow_pickle=False)
+    except (ValueError, OSError) as exc:
+        raise ArtifactIncompatibleError("invalid product_ids.npy") from exc
+    if not isinstance(product_ids, np.ndarray):
+        product_ids.close()
+        raise ArtifactIncompatibleError("product_ids.npy must contain a NumPy array")
+    if product_ids.ndim != 1 or product_ids.dtype.kind != "U":
+        raise ArtifactIncompatibleError("product_ids.npy must be a 1-D string array")
+    if len(set(product_ids.tolist())) != len(product_ids) or not np.all(product_ids != ""):
+        raise ArtifactIncompatibleError("product_ids.npy must contain unique nonempty IDs")
+    if len(product_ids) != embedding_manifest["product_count"]:
+        raise ArtifactIncompatibleError("manifest product_count does not match mapping length")
+    try:
+        index = load_index(index_path)
+    except (RuntimeError, ValueError) as exc:
+        raise ArtifactIncompatibleError(f"invalid FAISS file {index_path.name}") from exc
+    dimension = embedding_manifest["embedding_dimension"]
+    validate_index(index, backend=backend, dimension=dimension)
     if int(index.ntotal) != int(len(product_ids)):
         raise ArtifactIncompatibleError(
             f"index ntotal={index.ntotal} does not match mapping length={len(product_ids)}"
         )
-    dimension = int(embedding_manifest["embedding_dimension"])
-    if int(index.d) != dimension:
-        raise ArtifactIncompatibleError(f"index dimension {index.d} != manifest {dimension}")
-    if settings.semantic_index_type == "hnsw" and not hasattr(index, "hnsw"):
-        raise ArtifactIncompatibleError("SEMANTIC_INDEX_TYPE=hnsw but loaded index is not HNSW")
-    if settings.semantic_index_type == "flat" and hasattr(index, "hnsw"):
-        raise ArtifactIncompatibleError("SEMANTIC_INDEX_TYPE=flat but loaded index is HNSW")
-
-    checksum = embedding_manifest.get("checksums", {}).get("product_ids.npy")
-    if checksum:
-        from app.embeddings.checksums import sha256_file
-
-        actual = sha256_file(embed_paths["product_ids"])
-        if actual != checksum:
-            raise ArtifactIncompatibleError("product_ids.npy checksum mismatch")
+    if backend == "hnsw":
+        index.hnsw.efSearch = settings.semantic_hnsw_ef_search
+    if "semantic_catalog_sha256" not in embedding_manifest:
+        logger.warning(
+            "legacy semantic artifact %s lacks semantic_catalog_sha256; full semantic "
+            "catalog identity cannot be verified (count check only); rebuild recommended",
+            version,
+        )
 
     return SemanticRuntime(
         artifact_version=version,
@@ -170,8 +188,33 @@ def load_semantic_runtime(
 
 
 def ensure_runtime_matches_catalog(session: Session, runtime: SemanticRuntime) -> None:
+    """Verify new catalog provenance once per loaded runtime, including concurrency.
+
+    Catalog edits after success require a runtime reset/reload to be detected.
+    Legacy bundles retain their existing count check on each call.
+    """
+
     if runtime.skip_catalog_count_check:
         return
+    fingerprint = runtime.embedding_manifest.get("semantic_catalog_sha256")
+    if fingerprint is None:
+        _ensure_catalog_count(session, runtime)
+        return
+    if runtime._catalog_verified:
+        return
+    with runtime._catalog_validation_lock:
+        if runtime._catalog_verified:
+            return
+        _ensure_catalog_count(session, runtime)
+        actual = semantic_catalog_fingerprint(session, dataset_version=runtime.dataset_version)
+        if actual != fingerprint:
+            raise ArtifactIncompatibleError(
+                "catalog semantic_catalog_sha256 mismatch; rebuild semantic artifacts"
+            )
+        runtime._catalog_verified = True
+
+
+def _ensure_catalog_count(session: Session, runtime: SemanticRuntime) -> None:
     count = session.scalar(
         select(func.count())
         .select_from(Product)
@@ -222,4 +265,7 @@ def require_semantic_runtime(session: Session | None = None) -> SemanticRuntime:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise ArtifactIncompatibleError(f"invalid semantic manifest JSON: {path}") from exc

@@ -23,6 +23,7 @@ def write_fixture_artifacts(
     model_name: str = "fake-encoder",
     text_version: str = SEMANTIC_TEXT_VERSION,
     hnsw: bool = True,
+    semantic_catalog_sha256: str | None = None,
 ) -> Path:
     embeddings = l2_normalize(np.asarray(embeddings, dtype=np.float32))
     embed_dir = root / "embeddings" / artifact_version
@@ -59,6 +60,8 @@ def write_fixture_artifacts(
             "product_ids.npy": sha256_file(ids_path),
         },
     }
+    if semantic_catalog_sha256 is not None:
+        embedding_manifest["semantic_catalog_sha256"] = semantic_catalog_sha256
     write_json(embed_dir / "manifest.json", embedding_manifest)
     index_manifest = {
         **embedding_manifest,
